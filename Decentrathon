@@ -1,0 +1,165 @@
+const TelegramBot = require('node-telegram-bot-api')
+const { MongoClient } = require('mongodb')
+
+const uri = 'mongodb://<username>:<password>@localhost:27017/lms_db'
+const bot = new TelegramBot('7922767456:AAEzVMy6efZmXM6t8LzSRJ2w0x8gLTQh0TQ', {
+	polling: true,
+})
+
+const client = new MongoClient(uri)
+const usersCollection = client.db().collection('users')
+const coursesCollection = client.db().collection('courses')
+const feedbackCollection = client.db().collection('feedback')
+const quizzesCollection = client.db().collection('quizzes')
+let userStates = {}
+
+async function connectToMongo() {
+	await client.connect()
+}
+
+bot.onText(/\/register/, async msg => {
+	const userId = msg.from.id
+	const existingUser = await usersCollection.findOne({ user_id: userId })
+
+	if (!existingUser) {
+		await usersCollection.insertOne({
+			user_id: userId,
+			badges: [],
+			enrolled_courses: [],
+			quizzes_completed: 0,
+		})
+		bot.sendMessage(
+			userId,
+			'Registration successful! You can now enroll in courses.'
+		)
+	} else {
+		bot.sendMessage(userId, 'You are already registered.')
+	}
+})
+
+bot.onText(/\/enroll (.+)/, async (msg, match) => {
+	const userId = msg.from.id
+	const courseId = match[1]
+	const course = await coursesCollection.findOne({ course_id: courseId })
+
+	if (course) {
+		await usersCollection.updateOne(
+			{ user_id: userId },
+			{ $addToSet: { enrolled_courses: courseId } }
+		)
+		bot.sendMessage(userId, `You have been enrolled in ${course.name}!`)
+	} else {
+		bot.sendMessage(userId, 'Invalid course ID.')
+	}
+})
+
+bot.onText(/\/feedback/, msg => {
+	const userId = msg.from.id
+	userStates[userId] = { state: 'awaiting_course_id' }
+	bot.sendMessage(userId, 'Please enter the course ID for your feedback.')
+})
+
+bot.on('message', async msg => {
+	const userId = msg.from.id
+
+	if (userStates[userId]?.state === 'awaiting_course_id') {
+		const courseId = msg.text.trim()
+		const course = await coursesCollection.findOne({ course_id: courseId })
+
+		if (course) {
+			userStates[userId].state = 'awaiting_rating'
+			userStates[userId].course_id = courseId
+			bot.sendMessage(userId, `Rate the course ${course.name} from 1 to 5.`)
+		} else {
+			bot.sendMessage(userId, 'Invalid course ID. Please try again.')
+		}
+	} else if (userStates[userId]?.state === 'awaiting_rating') {
+		try {
+			const rating = parseInt(msg.text.trim())
+			if (rating >= 1 && rating <= 5) {
+				const courseId = userStates[userId].course_id
+				await feedbackCollection.insertOne({
+					user_id: userId,
+					course_id: courseId,
+					rating: rating,
+				})
+				bot.sendMessage(userId, 'Thank you for your feedback!')
+				delete userStates[userId]
+			} else {
+				bot.sendMessage(userId, 'Rating must be between 1 and 5.')
+			}
+		} catch {
+			bot.sendMessage(userId, 'Please enter a valid number.')
+		}
+	}
+})
+
+bot.onText(/\/my_badges/, async msg => {
+	const userId = msg.from.id
+	const user = await usersCollection.findOne({ user_id: userId })
+	const badges = user?.badges || []
+	bot.sendMessage(
+		userId,
+		badges.length
+			? `Your badges: ${badges.join(', ')}`
+			: 'You have no badges yet.'
+	)
+})
+
+async function awardBadge(userId, badgeName) {
+	await usersCollection.updateOne(
+		{ user_id: userId },
+		{ $addToSet: { badges: badgeName } }
+	)
+}
+
+async function checkAndAwardBadges(userId) {
+	const user = await usersCollection.findOne({ user_id: userId })
+	if (user.quizzes_completed >= 10 && !user.badges.includes('Quiz Master')) {
+		await awardBadge(userId, 'Quiz Master')
+	}
+}
+
+bot.onText(/\/courses/, async msg => {
+	const courses = await coursesCollection.find().toArray()
+	let response = 'Available Courses:\n'
+	for (const course of courses) {
+		const feedbacks = await feedbackCollection
+			.find({ course_id: course.course_id })
+			.toArray()
+		const avgRating = feedbacks.length
+			? feedbacks.reduce((sum, fb) => sum + fb.rating, 0) / feedbacks.length
+			: 0
+		response += `${course.name} - Average Rating: ${avgRating.toFixed(2)}\n`
+	}
+	bot.sendMessage(msg.from.id, response)
+})
+
+bot.onText(/\/quizzes/, async msg => {
+	const quizzes = await quizzesCollection.find().toArray()
+	let response = 'Available Quizzes:\n'
+	for (const quiz of quizzes) {
+		response += `${quiz.quiz_id}: ${quiz.name}\n`
+	}
+	bot.sendMessage(msg.from.id, response)
+})
+
+bot.onText(/\/take_quiz (.+)/, async (msg, match) => {
+	const userId = msg.from.id
+	const quizId = match[1]
+	const quiz = await quizzesCollection.findOne({ quiz_id: quizId })
+
+	if (quiz) {
+		bot.sendMessage(userId, `Starting quiz: ${quiz.name}`)
+	} else {
+		bot.sendMessage(userId, 'Invalid quiz ID.')
+	}
+})
+
+connectToMongo()
+	.then(() => {
+		console.log('Connected to MongoDB!')
+	})
+	.catch(err => {
+		console.error('Failed to connect to MongoDB:', err)
+	})
